@@ -1,0 +1,33 @@
+name: Access Review Export
+
+on:
+  schedule:
+    - cron: "0 2 * * 1"  # Weekly Monday
+  workflow_dispatch:
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Azure CLI
+        run: |
+          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+
+      - name: Login to Azure
+        run: |
+          az login --service-principal \
+            --username $AZURE_CLIENT_ID \
+            --password $AZURE_CLIENT_SECRET \
+            --tenant $AZURE_TENANT_ID
+
+      - name: Export artifacts
+        run: pwsh scripts/export_service_principals.ps1
+
+      - name: Upload results
+        uses: actions/upload-artifact@v3
+        with:
+          name: access-review-artifacts
+          path: "*.csv"
