@@ -41,7 +41,7 @@ jobs:
           ./export_access_review_artifacts.ps1
 
       - name: Upload Access Review Artifacts
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: access-review-artifacts
           path: |
