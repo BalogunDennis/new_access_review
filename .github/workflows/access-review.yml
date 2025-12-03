@@ -1,33 +1,50 @@
-name: Access Review Export
+name: Access Review Automation
 
 on:
-  schedule:
-    - cron: "0 2 * * 1"  # Weekly Monday
   workflow_dispatch:
+  schedule:
+    - cron: "0 1 * * 1"   # Every Monday 01:00 UTC (adjust)
+
+permissions:
+  id-token: write
+  contents: read
 
 jobs:
-  export:
+  export-access-review:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout Repository
+        uses: actions/checkout@v3
 
-      - name: Install Azure CLI
+      - name: Install Az PowerShell Module
+        shell: pwsh
         run: |
-          curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          Install-Module Az -Force -Scope CurrentUser
 
-      - name: Login to Azure
+      - name: Azure Login via OIDC
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          enable-AzPSSession: true
+
+      - name: Run Export Scripts
+        shell: pwsh
+        working-directory: scripts
         run: |
-          az login --service-principal \
-            --username $AZURE_CLIENT_ID \
-            --password $AZURE_CLIENT_SECRET \
-            --tenant $AZURE_TENANT_ID
+          ./export_service_principals.ps1
+          ./export_role_assignments.ps1
+          ./export_app_credentials.ps1
+          ./export_signin_logs.ps1
+          ./export_access_review_artifacts.ps1
 
-      - name: Export artifacts
-        run: pwsh scripts/export_service_principals.ps1
-
-      - name: Upload results
+      - name: Upload Access Review Artifacts
         uses: actions/upload-artifact@v3
         with:
           name: access-review-artifacts
-          path: "*.csv"
+          path: |
+            **/*.csv
+            **/*.json
+          retention-days: 30
