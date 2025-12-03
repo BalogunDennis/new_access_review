@@ -3,7 +3,7 @@ name: Access Review Automation
 on:
   workflow_dispatch:
   schedule:
-    - cron: "0 1 * * 1"   # Every Monday 01:00 UTC (adjust)
+    - cron: "0 1 * * *" # Adjust frequency (e.g., daily)
 
 permissions:
   id-token: write
@@ -13,6 +13,11 @@ jobs:
   export-access-review:
     runs-on: ubuntu-latest
 
+    env:
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v3
@@ -20,7 +25,7 @@ jobs:
       - name: Install Az PowerShell Module
         shell: pwsh
         run: |
-          Install-Module Az -Force -Scope CurrentUser
+          Install-Module Az -RequiredVersion 9.0.0 -Force -Scope CurrentUser
 
       - name: Azure Login via OIDC
         uses: azure/login@v2
@@ -30,15 +35,21 @@ jobs:
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
           enable-AzPSSession: true
 
+      - name: Validate Scripts
+        shell: pwsh
+        run: |
+          Test-Path ./export_service_principals.ps1
+          Test-Path ./export_role_assignments.ps1
+
       - name: Run Export Scripts
         shell: pwsh
         working-directory: scripts
         run: |
-          ./export_service_principals.ps1
-          ./export_role_assignments.ps1
-          ./export_app_credentials.ps1
-          ./export_signin_logs.ps1
-          ./export_access_review_artifacts.ps1
+          ./export_service_principals.ps1 -Verbose
+          ./export_role_assignments.ps1 -Verbose
+          ./export_app_credentials.ps1 -Verbose
+          ./export_signin_logs.ps1 -Verbose
+          ./export_access_review_artifacts.ps1 -Verbose
 
       - name: Upload Access Review Artifacts
         uses: actions/upload-artifact@v4
