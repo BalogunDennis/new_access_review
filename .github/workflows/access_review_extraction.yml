@@ -1,0 +1,181 @@
+name: Azure Access Review - Multi-Sub Governance
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 0 1 * *' # Runs 1st of every month
+
+env:
+  OUTPUT_FILE_RBAC: "Azure_RBAC_Governance_Tracker.csv"
+  OUTPUT_FILE_ENTRA: "Entra_Roles_Governance_Tracker.csv"
+
+jobs:
+  governance-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }} # Just for initial login
+          enable-AzPSSession: true
+
+      - name: Get Graph Token
+        id: graph_token
+        shell: pwsh
+        run: |
+          $Token = az account get-access-token --resource "https://graph.microsoft.com" | ConvertFrom-Json | Select-Object -ExpandProperty accessToken
+          echo "::add-mask::$Token"
+          "mgtoken=$Token" >> $env:GITHUB_OUTPUT
+
+      - name: Run Access Review Extraction
+        shell: pwsh
+        env:
+          MG_TOKEN: ${{ steps.graph_token.outputs.mgtoken }}
+        run: |
+          # --- SETUP ---
+          Write-Host "Installing Modules..."
+          if (-not (Get-Module -ListAvailable -Name Microsoft.Graph.Users)) {
+              Install-Module -Name Microsoft.Graph -Force -Scope CurrentUser -AllowClobber
+          }
+          
+          # Connect to Graph
+          $SecureToken = ConvertTo-SecureString -String "$env:MG_TOKEN" -AsPlainText -Force
+          Connect-MgGraph -AccessToken $SecureToken
+          
+          # --- STEP 1: PRE-FETCH USER CONTEXT (Optimized) ---
+          # We download all users once to look up Job Title, Dept, and Sign-in Activity later.
+          Write-Host "Fetching User Context (Job Titles, Last Login)..."
+          
+          # We need specific properties. 'SignInActivity' usually requires beta or specific permission.
+          $AllUsers = Get-MgUser -All -Property Id, DisplayName, UserPrincipalName, JobTitle, Department, AccountEnabled, SignInActivity
+          
+          # Create a Lookup Hash for speed
+          $UserMap = @{}
+          foreach ($User in $AllUsers) {
+              # Calculate Last Login Date
+              $LastSignIn = $null
+              if ($User.SignInActivity.LastSignInDateTime) {
+                  $LastSignIn = $User.SignInActivity.LastSignInDateTime
+              }
+              
+              $UserMap[$User.Id] = @{
+                  JobTitle       = $User.JobTitle
+                  Department     = $User.Department
+                  AccountStatus  = if ($User.AccountEnabled) { "Active" } else { "Disabled" }
+                  LastSignIn     = $LastSignIn
+                  UPN            = $User.UserPrincipalName
+              }
+          }
+          Write-Host "User context cached for $($UserMap.Count) users."
+
+          # --- STEP 2: MULTI-SUBSCRIPTION RBAC REVIEW ---
+          Write-Host "Getting list of all subscriptions..."
+          $Subs = Get-AzSubscription
+          $RBACReport = @()
+
+          foreach ($Sub in $Subs) {
+              Write-Host "Scanning Subscription: $($Sub.Name)..."
+              Set-AzContext -SubscriptionObject $Sub | Out-Null
+              
+              # Get Assignments
+              $Assignments = Get-AzRoleAssignment | Select-Object DisplayName, RoleDefinitionName, Scope, ObjectType, ObjectId, SignInName
+              
+              foreach ($Assignment in $Assignments) {
+                  # Lookup Context
+                  $Context = $UserMap[$Assignment.ObjectId]
+                  
+                  # Calculate 'Days Inactive' if we have a date
+                  $DaysInactive = ""
+                  if ($Context.LastSignIn) {
+                      $DaysInactive = (New-TimeSpan -Start $Context.LastSignIn -End (Get-Date)).Days
+                  }
+
+                  $RBACReport += [PSCustomObject]@{
+                      # --- Identity Info ---
+                      PrincipalName   = $Assignment.DisplayName
+                      PrincipalType   = $Assignment.ObjectType
+                      JobTitle        = $Context.JobTitle
+                      Department      = $Context.Department
+                      AccountStatus   = $Context.AccountStatus
+                      LastSignInDate  = $Context.LastSignIn
+                      DaysInactive    = $DaysInactive
+                      
+                      # --- Access Info ---
+                      Subscription    = $Sub.Name
+                      Role            = $Assignment.RoleDefinitionName
+                      Scope           = $Assignment.Scope
+                      
+                      # --- REVIEWER COLUMNS (Blank for input) ---
+                      Decision        = ""  # Approve / Modify / Revoke
+                      Justification   = ""
+                      ReviewerName    = ""
+                      ReviewDate      = ""
+                  }
+              }
+          }
+          
+          # Export RBAC
+          $RBACReport | Export-Csv -Path ${{ env.OUTPUT_FILE_RBAC }} -NoTypeInformation
+          Write-Host "RBAC Governance Report Generated."
+
+          # --- STEP 3: ENTRA ID ROLES REVIEW ---
+          Write-Host "Scanning Entra ID Roles..."
+          
+          # Cache Role Definitions
+          $RoleDefs = Get-MgRoleManagementDirectoryRoleDefinition -All
+          $RoleNameMap = @{}
+          foreach ($R in $RoleDefs) { $RoleNameMap[$R.Id] = $R.DisplayName }
+          
+          $EntraAssignments = Get-MgRoleManagementDirectoryRoleAssignment -All 
+          
+          $EntraReport = foreach ($Assignment in $EntraAssignments) {
+              $Context = $UserMap[$Assignment.PrincipalId]
+              
+              # Handle Unknown Principals
+              $PName = if ($Context) { $Context.UPN } else { "Unknown/ServicePrincipal" }
+              
+              # Calculate Inactivity
+              $DaysInactive = ""
+              if ($Context.LastSignIn) {
+                  $DaysInactive = (New-TimeSpan -Start $Context.LastSignIn -End (Get-Date)).Days
+              }
+
+              [PSCustomObject]@{
+                  PrincipalName   = $PName
+                  JobTitle        = $Context.JobTitle
+                  Department      = $Context.Department
+                  AccountStatus   = $Context.AccountStatus
+                  LastSignInDate  = $Context.LastSignIn
+                  DaysInactive    = $DaysInactive
+                  
+                  Role            = $RoleNameMap[$Assignment.RoleDefinitionId]
+                  Scope           = "Tenant"
+                  
+                  # --- REVIEWER COLUMNS ---
+                  Decision        = ""
+                  Justification   = ""
+                  ReviewerName    = ""
+                  ReviewDate      = ""
+              }
+          }
+
+          # Export Entra
+          $EntraReport | Export-Csv -Path ${{ env.OUTPUT_FILE_ENTRA }} -NoTypeInformation
+          Write-Host "Entra Governance Report Generated."
+
+      - name: Upload Governance Trackers
+        uses: actions/upload-artifact@v4
+        with:
+          name: Access-Review-Trackers
+          path: |
+            ${{ env.OUTPUT_FILE_RBAC }}
+            ${{ env.OUTPUT_FILE_ENTRA }}
