@@ -36,7 +36,7 @@ jobs:
           ./export_role_assignments.ps1
 
       - name: Upload Generated Files
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: manual-access-review-export
           path: |
